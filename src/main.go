@@ -28,12 +28,12 @@ import (
 )
 
 const (
-	SharedSecret          = "aeza-vps-2a0b4140df47-secure-key-2024" // Secret between client & server
+	SharedSecret          = "zaza-vps-2a0b4140df47-secure-key-2024" // Secret between client & server
 	Version               = "2.2"                                   // Version of the script
-	IPv6Prefix            = "2a0b:4140:df47"                        // Your /48 prefix from VPS
+	IPv6Prefix            = "2a01:e5c0:5226"                        // Your /48 prefix from VPS
 	IPv6Subnet            = "6000"                                  // Using subnet 6000 within your /48
 	Interface             = "ens3"                                  // Network interface (check with 'ip link show')
-	ListenPort            = 80                                      // Proxy server port
+    ListenPort            = 18080                                   // Proxy server port (behind Nginx)
 	ListenHost            = "127.0.0.1"                             // Listen on localhost only (Nginx will proxy)
 	RequestTimeout        = 30 * time.Second                        // Request timeout in seconds
 	Debug                 = false                                   // Enable debug output
@@ -44,6 +44,10 @@ const (
 	MaxRequestsPerIP      = 15                                      // Maximum requests allowed per IP before rotation
 	UnusedIPFlushInterval = 10 * time.Minute                        // Check for unused IPs every 10 minutes
 	IPInactivityThreshold = 30 * time.Minute                        // Remove IP if unused for this duration
+	
+	// IPv4 rotation settings
+	IPv4PoolSize          = 20                                      // Number of IPv4 addresses to rotate
+	IPv4BaseRange         = "106.196.19"                           // Base range for IPv4 rotation (your server's range)
 )
 
 // IPUsageTracker tracks usage statistics for each IP address
@@ -64,6 +68,11 @@ var (
 	poolMutex       sync.Mutex
 	currentIPIndex  int
 	urgentAddChan   = make(chan struct{}, 10) // Channel to signal urgent IP additions
+	
+	// IPv4 rotation variables
+	ipv4Pool        []string
+	ipv4PoolMutex   sync.Mutex
+	currentIPv4Index int
 )
 var skipHeaders = map[string]bool{
 	"transfer-encoding": true,
@@ -605,7 +614,27 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		hostname := parsedURL.Host
-		allowedHosts := []string{"rest.opensubtitles.org", "dl.opensubtitles.org", "subdl.com", "dl.subdl.com", "subf2m.co"}
+        allowedHosts := []string{
+            "rest.opensubtitles.org",
+            "dl.opensubtitles.org",
+            "subdl.com",
+            "dl.subdl.com",
+            "subf2m.co",
+            "ola.autoembed.cc",
+            "moviebox.ph",
+            "drophunter720.github.io",
+            "github.io",
+            "fuhho374key.com",
+            "smrta384und.com",
+			"api.ipify.org",
+            "httpbin.org",
+			"videostr.net",
+			"myflixerz.to",
+			"upcloud.1hd.su",
+			"upcloud.hotflix.info",
+			"1hd.su",
+			"hotflix.info", 
+        }
 		isAllowed := false
 
 		for _, allowed := range allowedHosts {
@@ -666,8 +695,24 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		useSpecificIP = false
 		fmt.Println("Using system default IP as requested by 'normal' parameter.")
 	} else {
+		// Check if target hostname supports IPv6
+		hasIPv6 := hasIPv6Support(hostname)
+		
 		var poolErr error
-		sourceIP, poolErr = getNextIPFromPool()
+		if hasIPv6 {
+			// Use IPv6 rotation for IPv6-capable targets
+			sourceIP, poolErr = getNextIPFromPool()
+			if Debug {
+				fmt.Printf("Target %s supports IPv6, using IPv6 pool\n", hostname)
+			}
+		} else {
+			// Use IPv4 rotation for IPv4-only targets
+			sourceIP = getNextIPv4()
+			if Debug {
+				fmt.Printf("Target %s is IPv4-only, using IPv4 rotation: %s\n", hostname, sourceIP)
+			}
+		}
+		
 		if poolErr != nil {
 			if strings.Contains(poolErr.Error(), "pool busy") {
 				if Debug {
@@ -686,7 +731,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				useSpecificIP = false
 			} else {
 				if Debug {
-					fmt.Printf("Using IP from pool: %s\n", sourceIP)
+					fmt.Printf("Using IP: %s\n", sourceIP)
 				}
 			}
 		}
@@ -1333,10 +1378,59 @@ func onStartup() bool {
 	return true
 }
 
+// initializeIPv4Pool creates a pool of IPv4 addresses for rotation
+func initializeIPv4Pool() {
+	ipv4PoolMutex.Lock()
+	defer ipv4PoolMutex.Unlock()
+	
+	ipv4Pool = make([]string, 0, IPv4PoolSize)
+	for i := 0; i < IPv4PoolSize; i++ {
+		// Generate IPv4 addresses in your server's range
+		// Using different last octets to simulate different IPs
+		lastOctet := 200 + (i % 55) // Use range 200-254
+		ipv4 := fmt.Sprintf("%s.%d", IPv4BaseRange, lastOctet)
+		ipv4Pool = append(ipv4Pool, ipv4)
+	}
+	
+	fmt.Printf("Initialized IPv4 pool with %d addresses\n", len(ipv4Pool))
+}
+
+// getNextIPv4 returns the next IPv4 address for rotation
+func getNextIPv4() string {
+	ipv4PoolMutex.Lock()
+	defer ipv4PoolMutex.Unlock()
+	
+	if len(ipv4Pool) == 0 {
+		return "106.196.19.251" // Fallback to your main IP
+	}
+	
+	ip := ipv4Pool[currentIPv4Index]
+	currentIPv4Index = (currentIPv4Index + 1) % len(ipv4Pool)
+	return ip
+}
+
+// hasIPv6Support checks if a hostname supports IPv6
+func hasIPv6Support(hostname string) bool {
+	addrs, err := net.LookupIP(hostname)
+	if err != nil {
+		return false
+	}
+	
+	for _, addr := range addrs {
+		if addr.To16() != nil && addr.To4() == nil {
+			return true // Found IPv6 address
+		}
+	}
+	return false
+}
+
 func main() {
 	// Initialize enhanced IP pool with usage tracking
 	ipPoolWithUsage = make([]*IPUsageTracker, 0, DesiredPoolSize)
 	currentIPIndex = 0
+	
+	// Initialize IPv4 pool for fallback
+	initializeIPv4Pool()
 
 	defaultTransport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
